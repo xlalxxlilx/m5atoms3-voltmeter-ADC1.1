@@ -1,0 +1,8 @@
+ssid=your_wifi_ssid
+password=your_wifi_password
+machine_id=atoms3_001
+script_url=your_google_apps_script_url
+full_scale_V=5.0
+full_scale_P=100.0
+unit_P=%
+voltage_offset=0

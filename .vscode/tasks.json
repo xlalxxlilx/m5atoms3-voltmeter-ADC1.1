@@ -1,0 +1,22 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "PlatformIO Upload",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe run --target upload",
+			"problemMatcher": [
+				"$platformio"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Serial Monitor",
+			"type": "shell",
+			"command": "${userHome}/.platformio/penv/Scripts/platformio.exe device monitor --port COM3 --baud 115200",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}
