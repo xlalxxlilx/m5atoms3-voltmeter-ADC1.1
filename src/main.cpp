@@ -256,7 +256,8 @@ static bool connectWithBestBssid(const char* targetSsid, const char* targetPassw
         String foundSsid;
         uint8_t enc = 0;
         int32_t rssi = 0;
-        uint8_t* bssid = nullptr;
+        uint8_t bssidRaw[6] = {0};
+        uint8_t* bssid = bssidRaw;
         int32_t channel = 0;
 
         if (!WiFi.getNetworkInfo(i, foundSsid, enc, rssi, bssid, channel)) {
@@ -580,11 +581,11 @@ void recording(float voltage, float scaledValue) {
         } else {
             // フォールバック
             time_t now = time(nullptr);
-            struct tm* timeInfoPtr = localtime(&now);
-            if (timeInfoPtr != nullptr) {
+            struct tm timeInfoLocal;
+            if (localtime_r(&now, &timeInfoLocal) != nullptr) {
                 snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
-                         timeInfoPtr->tm_year + 1900, timeInfoPtr->tm_mon + 1, timeInfoPtr->tm_mday,
-                         timeInfoPtr->tm_hour, timeInfoPtr->tm_min, timeInfoPtr->tm_sec);
+                         timeInfoLocal.tm_year + 1900, timeInfoLocal.tm_mon + 1, timeInfoLocal.tm_mday,
+                         timeInfoLocal.tm_hour, timeInfoLocal.tm_min, timeInfoLocal.tm_sec);
             } else {
                 snprintf(timestamp, sizeof(timestamp), "NO_TIME");
             }
@@ -592,11 +593,11 @@ void recording(float voltage, float scaledValue) {
     } else {
         // WiFi未接続時は直接time()とlocaltime()を使う（タイムアウト無し）
         time_t now = time(nullptr);
-        struct tm* timeInfoPtr = localtime(&now);
-        if (timeInfoPtr != nullptr) {
+        struct tm timeInfoLocal;
+        if (localtime_r(&now, &timeInfoLocal) != nullptr) {
             snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02d %02d:%02d:%02d",
-                     timeInfoPtr->tm_year + 1900, timeInfoPtr->tm_mon + 1, timeInfoPtr->tm_mday,
-                     timeInfoPtr->tm_hour, timeInfoPtr->tm_min, timeInfoPtr->tm_sec);
+                     timeInfoLocal.tm_year + 1900, timeInfoLocal.tm_mon + 1, timeInfoLocal.tm_mday,
+                     timeInfoLocal.tm_hour, timeInfoLocal.tm_min, timeInfoLocal.tm_sec);
         } else {
             snprintf(timestamp, sizeof(timestamp), "NO_TIME");
         }
@@ -848,11 +849,11 @@ void setup() {
         // 設定後の時刻を確認
         delay(100);
         time_t check_time = time(nullptr);
-        struct tm* check_tm = localtime(&check_time);
-        if (check_tm != nullptr) {
+        struct tm check_tm;
+        if (localtime_r(&check_time, &check_tm) != nullptr) {
             Serial.printf("RTC check: %04d-%02d-%02d %02d:%02d:%02d\n",
-                         check_tm->tm_year + 1900, check_tm->tm_mon + 1, check_tm->tm_mday,
-                         check_tm->tm_hour, check_tm->tm_min, check_tm->tm_sec);
+                         check_tm.tm_year + 1900, check_tm.tm_mon + 1, check_tm.tm_mday,
+                         check_tm.tm_hour, check_tm.tm_min, check_tm.tm_sec);
         }
         
         AtomS3.Display.println("RTC: 2000");
