@@ -13,6 +13,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include "esp_log.h"
+#include "esp_system.h"
 
 // ピン設定
 // ATOMIC TF Card Base (SPI):
@@ -39,6 +41,7 @@ unsigned long lastPostTime = 0;
 unsigned long lastButtonTime = 0;
 bool wifiConnected = false;
 static bool g_gotIp = false;
+static esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;
 
 static void showWiFiProgress(const String& line1, const String& line2 = "") {
     // Reserve the lower area for transient WiFi progress logs.
@@ -236,8 +239,10 @@ float voltage_offset = 0.0F;
 static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
         g_gotIp = true;
+        wifiConnected = true;
         Serial.printf("[GOT_IP] %s\n", WiFi.localIP().toString().c_str());
     } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        wifiConnected = false;
         Serial.printf("[DISCONNECTED] reason=%u\n", info.wifi_sta_disconnected.reason);
     }
 }
@@ -391,26 +396,46 @@ void loadConfig() {
 }
 
 // HTTP POSTリクエストを送信する関数
-void sendPostRequest(String url, String jsonText) {
+bool sendPostRequest(const char* url, const char* jsonText) {
     if (WiFi.status() != WL_CONNECTED) {
-        return;
+        Serial.println("POST skipped: WiFi disconnected");
+        return false;
     }
 
     HTTPClient http;
-    http.begin(url);
+    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+    bool begun = false;
+
+    WiFiClientSecure secureClient;
+    if (isHttps) {
+        secureClient.setInsecure();
+        begun = http.begin(secureClient, url);
+    } else {
+        begun = http.begin(url);
+    }
+
+    if (!begun) {
+        Serial.println("POST begin failed");
+        return false;
+    }
+
+    http.setReuse(false);
+    http.useHTTP10(true);
+    http.setConnectTimeout(5000);
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(5000);  // 5秒タイムアウト
+    http.setTimeout(7000);
     int httpResponseCode = http.POST(jsonText);
     
-    Serial.printf("POST Response: %d\n", httpResponseCode);
+    Serial.printf("POST Response: %d (heap=%u)\n", httpResponseCode, ESP.getFreeHeap());
     http.end();
+    return (httpResponseCode > 0 && httpResponseCode < 400);
 }
 
 // POSTリクエストをキューに追加する関数
-void queuePostRequest(String url, String jsonText) {
+void queuePostRequest(const String& url, const char* jsonText) {
     PostData postData;
     strncpy(postData.url, url.c_str(), sizeof(postData.url) - 1);
-    strncpy(postData.json, jsonText.c_str(), sizeof(postData.json) - 1);
+    strncpy(postData.json, jsonText, sizeof(postData.json) - 1);
     postData.url[sizeof(postData.url) - 1] = '\0';
     postData.json[sizeof(postData.json) - 1] = '\0';
     
@@ -422,26 +447,74 @@ void queuePostRequest(String url, String jsonText) {
 // POSTリクエストを処理するタスク
 void postTask(void* parameter) {
     PostData postData;
+    unsigned long lastHealthLog = 0;
     
     while (true) {
         // キューからデータを取得（最大100ms待機）
         if (xQueueReceive(postQueue, &postData, pdMS_TO_TICKS(100)) == pdTRUE) {
             Serial.println("Processing POST request in background...");
-            sendPostRequest(String(postData.url), String(postData.json));
+            const bool ok = sendPostRequest(postData.url, postData.json);
+            if (!ok && WiFi.status() == WL_CONNECTED) {
+                // 一時的な通信失敗を軽減するため1回だけ即時リトライ
+                vTaskDelay(pdMS_TO_TICKS(200));
+                sendPostRequest(postData.url, postData.json);
+            }
+        }
+
+        const unsigned long now = millis();
+        if ((now - lastHealthLog) >= 60000) {
+            lastHealthLog = now;
+            const UBaseType_t watermark = uxTaskGetStackHighWaterMark(nullptr);
+            Serial.printf("[PostTask] queue=%u stackHW=%u heap=%u\n",
+                          static_cast<unsigned>(uxQueueMessagesWaiting(postQueue)),
+                          static_cast<unsigned>(watermark),
+                          ESP.getFreeHeap());
         }
         vTaskDelay(pdMS_TO_TICKS(10));  // 短い間隔でCPUを解放
     }
 }
 
-// mapからJSON文字列を作成する関数
-String createJsonFromMap(std::map<String, String> data) {
-    DynamicJsonDocument doc(1024);
-    for (auto& pair : data) {
-        doc[pair.first] = pair.second;
+static size_t buildRecordingJson(float voltage, float scaledValue, const char* timestamp,
+                                 char* out, size_t outSize) {
+    StaticJsonDocument<384> doc;
+    char pressureBuf[24];
+    char voltageBuf[24];
+
+    snprintf(pressureBuf, sizeof(pressureBuf), "%.1f", scaledValue);
+    snprintf(voltageBuf, sizeof(voltageBuf), "%.3f", voltage);
+
+    doc["machine_id"] = machine_id.c_str();
+    doc["status"] = "rec";
+    doc["unit_P"] = unit_P.c_str();
+    doc["pressure"] = pressureBuf;
+    doc["voltage"] = voltageBuf;
+    doc["timestamp"] = timestamp;
+
+    return serializeJson(doc, out, outSize);
+}
+
+static const char* resetReasonStr(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT_PIN";
+        case ESP_RST_SW:        return "SOFTWARE";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WATCHDOG";
+        case ESP_RST_TASK_WDT:  return "TASK_WATCHDOG";
+        case ESP_RST_WDT:       return "WATCHDOG";
+        case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
     }
-    String jsonString;
-    serializeJson(doc, jsonString);
-    return jsonString;
+}
+
+static size_t buildRebootJson(char* out, size_t outSize) {
+    StaticJsonDocument<192> doc;
+    doc["machine_id"] = machine_id.c_str();
+    doc["status"] = "reboot";
+    doc["reason"] = resetReasonStr(g_resetReason);
+    return serializeJson(doc, out, outSize);
 }
 
 // LOGDATA.csvを初期化する関数
@@ -472,16 +545,14 @@ void sendRecordingPost(float voltage, float scaledValue, const char* timestamp) 
     lastPostTime = currentTime;
     
     if (WiFi.status() == WL_CONNECTED) {
-        std::map<String, String> data;
-        data["machine_id"] = machine_id;
-        data["status"] = "rec";
-        data["unit_P"] = unit_P;
-        data["pressure"] = String(scaledValue, 1);
-        data["voltage"] = String(voltage, 3);
-        data["timestamp"] = String(timestamp);
-        
-        String jsonText = createJsonFromMap(data);
-        Serial.printf("Queueing POST: %s\n", jsonText.c_str());
+        char jsonText[512];
+        const size_t jsonLen = buildRecordingJson(voltage, scaledValue, timestamp, jsonText, sizeof(jsonText));
+        if (jsonLen == 0 || jsonLen >= sizeof(jsonText)) {
+            Serial.println("Failed to build rec JSON");
+            return;
+        }
+
+        Serial.printf("Queueing POST: %s\n", jsonText);
         queuePostRequest(script_url, jsonText);
     }
 }
@@ -562,6 +633,9 @@ void recordTask(void* parameter) {
 }
 
 void setup() {
+    // M5AtomS3ライブラリ内部が GPIO22 を操作する際に出る無害なエラーログを抑制
+    esp_log_level_set("gpio", ESP_LOG_NONE);
+
     // Initialize M5AtomS3
     auto cfg = M5.config();
     AtomS3.begin(cfg);
@@ -574,6 +648,20 @@ void setup() {
     AtomS3.Display.println("AtomS3 Vmeter");
     
     Serial.begin(115200);
+
+    // リセット理由を最優先で取得・表示
+    g_resetReason = esp_reset_reason();
+    Serial.printf("=== RESET REASON: %s (%d) ===\n", resetReasonStr(g_resetReason), (int)g_resetReason);
+
+    // POWERON 以外のリセットは画面にも表示
+    if (g_resetReason != ESP_RST_POWERON) {
+        AtomS3.Display.setTextColor(ORANGE);
+        AtomS3.Display.printf("RST:%s", resetReasonStr(g_resetReason));
+        delay(3000);
+        AtomS3.Display.fillScreen(BLACK);
+        AtomS3.Display.setCursor(0, 0);
+    }
+
     Serial.println("M5AtomS3 Voltmeter initialized");
 
     // スプライト初期化（128x128ピクセル）
@@ -716,17 +804,17 @@ void setup() {
         delay(2000);
         
         // Send reboot status
-        std::map<String, String> data;
-        data["machine_id"] = machine_id;
-        data["status"] = "reboot";
-        String jsonText = createJsonFromMap(data);
-        queuePostRequest(script_url, jsonText);
+        char rebootJson[256];
+        const size_t rebootLen = buildRebootJson(rebootJson, sizeof(rebootJson));
+        if (rebootLen > 0 && rebootLen < sizeof(rebootJson)) {
+            queuePostRequest(script_url, rebootJson);
+        }
         
         // POSTタスクを起動（Core 0で実行）
         xTaskCreatePinnedToCore(
             postTask,           // タスク関数
             "PostTask",         // タスク名
-            8192,               // スタックサイズ
+            16384,              // スタックサイズ（SSL+HTTPClient用に余裕を確保）
             NULL,               // パラメータ
             1,                  // 優先度
             &postTaskHandle,    // タスクハンドル
