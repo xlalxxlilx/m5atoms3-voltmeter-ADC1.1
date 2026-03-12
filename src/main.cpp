@@ -13,8 +13,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 
 // ピン設定
 // ATOMIC TF Card Base (SPI):
@@ -37,11 +39,11 @@ m5::unit::UnitADC11 vmeter_unit{VMETER_FACTOR, VMETER_ADDR};
 // Recording flag
 int rec_flag = 0;
 unsigned long lastRecordTime = 0;
-unsigned long lastPostTime = 0;
 unsigned long lastButtonTime = 0;
 bool wifiConnected = false;
 static bool g_gotIp = false;
 static esp_reset_reason_t g_resetReason = ESP_RST_UNKNOWN;
+static const char* TAG = "VMETER";
 
 static void showWiFiProgress(const String& line1, const String& line2 = "") {
     // Reserve the lower area for transient WiFi progress logs.
@@ -213,11 +215,16 @@ QueueHandle_t postQueue;
 TaskHandle_t postTaskHandle;
 QueueHandle_t recordQueue;
 TaskHandle_t recordTaskHandle;
+SemaphoreHandle_t sdMutex;
+
+File g_logFile;
+unsigned long g_lastLogFlushTime = 0;
+uint32_t g_logLinesSinceFlush = 0;
 
 // POSTデータ構造体
 typedef struct {
     char url[256];
-    char json[512];
+    char json[3072];
 } PostData;
 
 // Recording用データ構造体
@@ -225,6 +232,23 @@ typedef struct {
     float voltage;
     float scaledValue;
 } RecordData;
+
+typedef struct {
+    float voltage;
+    float scaledValue;
+    char timestamp[32];
+} BatchRecordData;
+
+constexpr unsigned long POST_BATCH_INTERVAL_MS = 10000;
+constexpr size_t MAX_BATCH_RECORDS = 24;
+constexpr uint32_t MIN_HTTP_HEAP_BYTES = 50000;
+constexpr unsigned long TASK_HEALTH_LOG_INTERVAL_MS = 10000;
+BatchRecordData postBatchRecords[MAX_BATCH_RECORDS];
+size_t postBatchCount = 0;
+unsigned long postBatchStartTime = 0;
+StaticJsonDocument<4096> g_batchPostDoc;
+char g_batchPostJson[3072];
+char g_recordsJson[2304];
 
 // 設定値 (デフォルト値を設定)
 String ssid = "default-ssid";  // SDカードから読み込まれない場合のデフォルト
@@ -403,6 +427,14 @@ bool sendPostRequest(const char* url, const char* jsonText) {
         return false;
     }
 
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    if (freeHeap < MIN_HTTP_HEAP_BYTES || largestBlock < 20000) {
+        Serial.printf("POST skipped: low heap (free=%u, largest=%u)\n", freeHeap, largestBlock);
+        ESP_LOGW(TAG, "POST skipped: low heap (free=%u, largest=%u)", freeHeap, largestBlock);
+        return false;
+    }
+
     HTTPClient http;
     const bool isHttps = (strncmp(url, "https://", 8) == 0);
     bool begun = false;
@@ -434,7 +466,7 @@ bool sendPostRequest(const char* url, const char* jsonText) {
 
 // POSTリクエストをキューに追加する関数
 void queuePostRequest(const String& url, const char* jsonText) {
-    PostData postData;
+    static PostData postData;
     strncpy(postData.url, url.c_str(), sizeof(postData.url) - 1);
     strncpy(postData.json, jsonText, sizeof(postData.json) - 1);
     postData.url[sizeof(postData.url) - 1] = '\0';
@@ -447,7 +479,7 @@ void queuePostRequest(const String& url, const char* jsonText) {
 
 // POSTリクエストを処理するタスク
 void postTask(void* parameter) {
-    PostData postData;
+    static PostData postData;
     unsigned long lastHealthLog = 0;
     
     while (true) {
@@ -475,23 +507,41 @@ void postTask(void* parameter) {
     }
 }
 
-static size_t buildRecordingJson(float voltage, float scaledValue, const char* timestamp,
-                                 char* out, size_t outSize) {
-    StaticJsonDocument<384> doc;
-    char pressureBuf[24];
-    char voltageBuf[24];
+static size_t buildRecordingBatchJson(const BatchRecordData* records, size_t recordCount,
+                                      char* out, size_t outSize) {
+    g_batchPostDoc.clear();
+    size_t pos = 0;
+    if (sizeof(g_recordsJson) < 3) {
+        return 0;
+    }
 
-    snprintf(pressureBuf, sizeof(pressureBuf), "%.1f", scaledValue);
-    snprintf(voltageBuf, sizeof(voltageBuf), "%.3f", voltage);
+    g_recordsJson[pos++] = '[';
+    for (size_t i = 0; i < recordCount; ++i) {
+        const int written = snprintf(
+            g_recordsJson + pos,
+            sizeof(g_recordsJson) - pos,
+            "%s{\"timestamp\":\"%s\",\"voltage\":%.3f,\"pressure\":%.1f}",
+            (i == 0) ? "" : ",",
+            records[i].timestamp,
+            records[i].voltage,
+            records[i].scaledValue
+        );
+        if (written <= 0 || static_cast<size_t>(written) >= (sizeof(g_recordsJson) - pos)) {
+            return 0;
+        }
+        pos += static_cast<size_t>(written);
+    }
+    g_recordsJson[pos++] = ']';
+    g_recordsJson[pos] = '\0';
 
-    doc["machine_id"] = machine_id.c_str();
-    doc["status"] = "rec";
-    doc["unit_P"] = unit_P.c_str();
-    doc["pressure"] = pressureBuf;
-    doc["voltage"] = voltageBuf;
-    doc["timestamp"] = timestamp;
+    g_batchPostDoc["machine_id"] = machine_id.c_str();
+    g_batchPostDoc["status"] = "rec_batch";
+    g_batchPostDoc["unit_P"] = unit_P.c_str();
+    g_batchPostDoc["interval_sec"] = 10;
+    g_batchPostDoc["count"] = static_cast<uint32_t>(recordCount);
+    g_batchPostDoc["records"] = g_recordsJson;
 
-    return serializeJson(doc, out, outSize);
+    return serializeJson(g_batchPostDoc, out, outSize);
 }
 
 static const char* resetReasonStr(esp_reset_reason_t reason) {
@@ -518,6 +568,32 @@ static size_t buildRebootJson(char* out, size_t outSize) {
     return serializeJson(doc, out, outSize);
 }
 
+static bool ensureLogFileOpen() {
+    if (g_logFile) {
+        return true;
+    }
+
+    g_logFile = SD.open("/LOGDATA.csv", FILE_APPEND);
+    if (!g_logFile) {
+        Serial.println("Failed to open LOGDATA.csv for append");
+        ESP_LOGE(TAG, "Failed to open LOGDATA.csv for append");
+        return false;
+    }
+    return true;
+}
+
+static void flushLogFileIfNeeded(unsigned long nowMs) {
+    if (!g_logFile) {
+        return;
+    }
+
+    if (g_logLinesSinceFlush >= 10 || (nowMs - g_lastLogFlushTime) >= 5000) {
+        g_logFile.flush();
+        g_lastLogFlushTime = nowMs;
+        g_logLinesSinceFlush = 0;
+    }
+}
+
 // LOGDATA.csvを初期化する関数
 void initLogFile() {
     // LOGDATA.csvが存在するかチェック
@@ -537,28 +613,58 @@ void initLogFile() {
     }
 }
 
-// HTTP POSTリクエストを送信する処理（1秒ごと）
+// HTTP POSTリクエストを送信する処理（10秒ごとにまとめ送信）
 void sendRecordingPost(float voltage, float scaledValue, const char* timestamp) {
-    unsigned long currentTime = millis();
-    if (currentTime - lastPostTime < 1000) {
-        return;  // 1秒経過していないのでスキップ
+    if (postBatchCount == 0) {
+        postBatchStartTime = millis();
     }
-    lastPostTime = currentTime;
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        char jsonText[512];
-        const size_t jsonLen = buildRecordingJson(voltage, scaledValue, timestamp, jsonText, sizeof(jsonText));
-        if (jsonLen == 0 || jsonLen >= sizeof(jsonText)) {
-            Serial.println("Failed to build rec JSON");
-            return;
-        }
 
-        Serial.printf("Queueing POST: %s\n", jsonText);
-        queuePostRequest(script_url, jsonText);
+    if (postBatchCount >= MAX_BATCH_RECORDS) {
+        if (WiFi.status() == WL_CONNECTED) {
+            const size_t jsonLen =
+                buildRecordingBatchJson(postBatchRecords, postBatchCount, g_batchPostJson, sizeof(g_batchPostJson));
+            if (jsonLen > 0 && jsonLen < sizeof(g_batchPostJson)) {
+                Serial.printf("Queueing batch POST (count=%u)\n", static_cast<unsigned>(postBatchCount));
+                queuePostRequest(script_url, g_batchPostJson);
+            } else {
+                Serial.println("Failed to build full batch JSON");
+            }
+        }
+        postBatchCount = 0;
+        postBatchStartTime = millis();
     }
+
+    postBatchRecords[postBatchCount].voltage = voltage;
+    postBatchRecords[postBatchCount].scaledValue = scaledValue;
+    strncpy(postBatchRecords[postBatchCount].timestamp, timestamp,
+            sizeof(postBatchRecords[postBatchCount].timestamp) - 1);
+    postBatchRecords[postBatchCount].timestamp[sizeof(postBatchRecords[postBatchCount].timestamp) - 1] = '\0';
+    postBatchCount++;
+
+    unsigned long currentTime = millis();
+    if (currentTime - postBatchStartTime < POST_BATCH_INTERVAL_MS) {
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Batch POST skipped: WiFi disconnected");
+        return;
+    }
+
+    const size_t jsonLen =
+        buildRecordingBatchJson(postBatchRecords, postBatchCount, g_batchPostJson, sizeof(g_batchPostJson));
+    if (jsonLen == 0 || jsonLen >= sizeof(g_batchPostJson)) {
+        Serial.println("Failed to build batch JSON");
+        return;
+    }
+
+    Serial.printf("Queueing batch POST (count=%u)\n", static_cast<unsigned>(postBatchCount));
+    queuePostRequest(script_url, g_batchPostJson);
+    postBatchCount = 0;
+    postBatchStartTime = currentTime;
 }
 
-// 記録処理を行う関数（CSVを0.5秒ごと、POSTを1秒ごと）
+// 記録処理を行う関数（CSVを0.5秒ごと、POSTを10秒ごとにまとめ送信）
 void recording(float voltage, float scaledValue) {
     // 0.5秒ごとに実行
     unsigned long currentTime = millis();
@@ -604,17 +710,27 @@ void recording(float voltage, float scaledValue) {
     }
     
     // CSVファイルに記録（0.5秒ごと）
-    File logFile = SD.open("/LOGDATA.csv", FILE_APPEND);
-    if (logFile) {
-        logFile.printf("%s,%.3f,%.3f,%s\n", timestamp, voltage, scaledValue, unit_P.c_str());
-        logFile.close();
-        // デバッグ用（コメントアウトで高速化）
-        Serial.printf("Logged: %s,%.3f,%.3f,%s\n", timestamp, voltage, scaledValue, unit_P.c_str());
+    if (sdMutex != nullptr && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (ensureLogFileOpen()) {
+            const int written = g_logFile.printf("%s,%.3f,%.3f,%s\n", timestamp, voltage, scaledValue, unit_P.c_str());
+            if (written > 0) {
+                g_logLinesSinceFlush++;
+                flushLogFileIfNeeded(currentTime);
+                // デバッグ用（コメントアウトで高速化）
+                Serial.printf("Logged: %s,%.3f,%.3f,%s\n", timestamp, voltage, scaledValue, unit_P.c_str());
+            } else {
+                Serial.println("LOG write failed, reopen file");
+                ESP_LOGE(TAG, "LOG write failed, reopen file");
+                g_logFile.close();
+            }
+        }
+        xSemaphoreGive(sdMutex);
     } else {
-        Serial.println("Failed to open LOGDATA.csv for writing");
+        Serial.println("SD mutex timeout");
+        ESP_LOGW(TAG, "SD mutex timeout");
     }
     
-    // HTTP POSTリクエスト送信（1秒ごと、WiFi接続済みの場合のみ）
+    // HTTP POSTリクエスト送信（10秒分をまとめて、10秒ごと）
     if (wifiConnected) {
         sendRecordingPost(voltage, scaledValue, timestamp);
     }
@@ -623,11 +739,33 @@ void recording(float voltage, float scaledValue) {
 // Recording用タスク（非同期処理）
 void recordTask(void* parameter) {
     RecordData data;
+    unsigned long lastHealthLog = 0;
+
+    Serial.println("[RecordTask] started");
+    ESP_LOGI(TAG, "[RecordTask] started");
     
     while (true) {
         // キューからデータを取得（最大100ms待機）
         if (xQueueReceive(recordQueue, &data, pdMS_TO_TICKS(100)) == pdTRUE) {
             recording(data.voltage, data.scaledValue);
+        }
+
+        const unsigned long now = millis();
+        if ((now - lastHealthLog) >= TASK_HEALTH_LOG_INTERVAL_MS) {
+            lastHealthLog = now;
+            const UBaseType_t watermark = uxTaskGetStackHighWaterMark(nullptr);
+            Serial.printf("[RecordTask] queue=%u batch=%u stackHW=%u heap=%u largest=%u\n",
+                          static_cast<unsigned>(uxQueueMessagesWaiting(recordQueue)),
+                          static_cast<unsigned>(postBatchCount),
+                          static_cast<unsigned>(watermark),
+                          ESP.getFreeHeap(),
+                          heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            ESP_LOGI(TAG, "[RecordTask] queue=%u batch=%u stackHW=%u heap=%u largest=%u",
+                     static_cast<unsigned>(uxQueueMessagesWaiting(recordQueue)),
+                     static_cast<unsigned>(postBatchCount),
+                     static_cast<unsigned>(watermark),
+                     ESP.getFreeHeap(),
+                     heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -649,6 +787,12 @@ void setup() {
     AtomS3.Display.println("AtomS3 Vmeter");
     
     Serial.begin(115200);
+    const unsigned long serialWaitStart = millis();
+    while (!Serial && (millis() - serialWaitStart) < 1500) {
+        delay(10);
+    }
+    Serial.println("Serial ready");
+    ESP_LOGI(TAG, "Serial ready");
 
     // リセット理由を最優先で取得・表示
     g_resetReason = esp_reset_reason();
@@ -692,6 +836,12 @@ void setup() {
     recordQueue = xQueueCreate(10, sizeof(RecordData));
     if (recordQueue == NULL) {
         Serial.println("Failed to create Record queue");
+    }
+
+    sdMutex = xSemaphoreCreateMutex();
+    if (sdMutex == nullptr) {
+        Serial.println("Failed to create SD mutex");
+        ESP_LOGE(TAG, "Failed to create SD mutex");
     }
 
     // Initialize I2C for Voltmeter Unit (Grove Port A)
@@ -747,6 +897,12 @@ void setup() {
     
     // Initialize log file
     initLogFile();
+
+    if (sdMutex != nullptr && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        ensureLogFileOpen();
+        g_lastLogFlushTime = millis();
+        xSemaphoreGive(sdMutex);
+    }
 
     if (ssid == "") {
         AtomS3.Display.setTextColor(RED);
@@ -860,16 +1016,22 @@ void setup() {
     }
     
     // Recordingタスクを起動（Core 0で実行、WiFi状態に関わらず）
-    xTaskCreatePinnedToCore(
+    const BaseType_t recordTaskResult = xTaskCreatePinnedToCore(
         recordTask,         // タスク関数
         "RecordTask",       // タスク名
-        8192,               // スタックサイズ
+        12288,              // スタックサイズ
         NULL,               // パラメータ
         1,                  // 優先度
         &recordTaskHandle,  // タスクハンドル
         0                   // Core 0で実行
     );
-    Serial.println("Record task started on Core 0");
+    if (recordTaskResult == pdPASS) {
+        Serial.println("Record task started on Core 0");
+        ESP_LOGI(TAG, "Record task started on Core 0");
+    } else {
+        Serial.printf("Record task create FAILED (err=%ld)\n", (long)recordTaskResult);
+        ESP_LOGE(TAG, "Record task create FAILED (err=%ld)", (long)recordTaskResult);
+    }
 }
 
 void loop() {
@@ -920,6 +1082,22 @@ void loop() {
     canvas.printf("%.3f\n", scaledValue);
     canvas.setTextSize(2);
     canvas.printf("%s\n", unit_P.c_str());
+
+    // 画面下部に現在時刻を表示
+    char nowText[24];
+    time_t now = time(nullptr);
+    struct tm nowTm;
+    if (localtime_r(&now, &nowTm) != nullptr) {
+        snprintf(nowText, sizeof(nowText), "%04d-%02d-%02d %02d:%02d:%02d",
+                 nowTm.tm_year + 1900, nowTm.tm_mon + 1, nowTm.tm_mday,
+                 nowTm.tm_hour, nowTm.tm_min, nowTm.tm_sec);
+    } else {
+        snprintf(nowText, sizeof(nowText), "NO_TIME");
+    }
+    canvas.setTextSize(1);
+    canvas.setTextColor(CYAN);
+    canvas.setCursor(0, 118);
+    canvas.print(nowText);
     
     // スプライトを画面に一気に転送（ちらつき防止）
     canvas.pushSprite(0, 0);
