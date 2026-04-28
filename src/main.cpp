@@ -225,6 +225,7 @@ uint32_t g_logLinesSinceFlush = 0;
 typedef struct {
     char url[256];
     char json[3072];
+    bool heartbeat;
 } PostData;
 
 // Recording用データ構造体
@@ -240,15 +241,23 @@ typedef struct {
 } BatchRecordData;
 
 constexpr unsigned long POST_BATCH_INTERVAL_MS = 10000;
+constexpr unsigned long HEARTBEAT_INTERVAL_MS = 60000;
+constexpr unsigned long HEARTBEAT_RESULT_DISPLAY_MS = 60000;
 constexpr size_t MAX_BATCH_RECORDS = 24;
 constexpr uint32_t MIN_HTTP_HEAP_BYTES = 50000;
 constexpr unsigned long TASK_HEALTH_LOG_INTERVAL_MS = 10000;
 BatchRecordData postBatchRecords[MAX_BATCH_RECORDS];
 size_t postBatchCount = 0;
 unsigned long postBatchStartTime = 0;
+unsigned long lastHeartbeatQueueTime = 0;
 StaticJsonDocument<4096> g_batchPostDoc;
 char g_batchPostJson[3072];
 char g_recordsJson[2304];
+char g_heartbeatJson[256];
+volatile bool g_heartbeatPending = false;
+volatile bool g_hasHeartbeatResult = false;
+volatile bool g_lastHeartbeatOk = false;
+volatile unsigned long g_lastHeartbeatResultAt = 0;
 
 // 設定値 (デフォルト値を設定)
 String ssid = "default-ssid";  // SDカードから読み込まれない場合のデフォルト
@@ -465,15 +474,22 @@ bool sendPostRequest(const char* url, const char* jsonText) {
 }
 
 // POSTリクエストをキューに追加する関数
-void queuePostRequest(const String& url, const char* jsonText) {
+void queuePostRequest(const String& url, const char* jsonText, bool isHeartbeat = false) {
     static PostData postData;
     strncpy(postData.url, url.c_str(), sizeof(postData.url) - 1);
     strncpy(postData.json, jsonText, sizeof(postData.json) - 1);
+    postData.heartbeat = isHeartbeat;
     postData.url[sizeof(postData.url) - 1] = '\0';
     postData.json[sizeof(postData.json) - 1] = '\0';
     
     if (xQueueSend(postQueue, &postData, 0) != pdTRUE) {
         Serial.println("POST queue full, discarding request");
+        if (isHeartbeat) {
+            g_heartbeatPending = false;
+            g_hasHeartbeatResult = true;
+            g_lastHeartbeatOk = false;
+            g_lastHeartbeatResultAt = millis();
+        }
     }
 }
 
@@ -486,11 +502,18 @@ void postTask(void* parameter) {
         // キューからデータを取得（最大100ms待機）
         if (xQueueReceive(postQueue, &postData, pdMS_TO_TICKS(100)) == pdTRUE) {
             Serial.println("Processing POST request in background...");
-            const bool ok = sendPostRequest(postData.url, postData.json);
+            bool ok = sendPostRequest(postData.url, postData.json);
             if (!ok && WiFi.status() == WL_CONNECTED) {
                 // 一時的な通信失敗を軽減するため1回だけ即時リトライ
                 vTaskDelay(pdMS_TO_TICKS(200));
-                sendPostRequest(postData.url, postData.json);
+                ok = sendPostRequest(postData.url, postData.json);
+            }
+
+            if (postData.heartbeat) {
+                g_heartbeatPending = false;
+                g_hasHeartbeatResult = true;
+                g_lastHeartbeatOk = ok;
+                g_lastHeartbeatResultAt = millis();
             }
         }
 
@@ -520,7 +543,7 @@ static size_t buildRecordingBatchJson(const BatchRecordData* records, size_t rec
         const int written = snprintf(
             g_recordsJson + pos,
             sizeof(g_recordsJson) - pos,
-            "%s{\"timestamp\":\"%s\",\"voltage\":%.3f,\"pressure\":%.1f}",
+            "%s{\"timestamp\":\"%s\",\"voltage\":%.3f,\"pressure\":%.3f}",
             (i == 0) ? "" : ",",
             records[i].timestamp,
             records[i].voltage,
@@ -565,6 +588,29 @@ static size_t buildRebootJson(char* out, size_t outSize) {
     doc["machine_id"] = machine_id.c_str();
     doc["status"] = "reboot";
     doc["reason"] = resetReasonStr(g_resetReason);
+    return serializeJson(doc, out, outSize);
+}
+
+static size_t buildStableHeartbeatJson(float voltage, float scaledValue, const char* timestamp,
+                                       char* out, size_t outSize) {
+    StaticJsonDocument<256> doc;
+    const int written = snprintf(
+        g_recordsJson,
+        sizeof(g_recordsJson),
+        "[{\"timestamp\":\"%s\",\"voltage\":%.3f,\"pressure\":%.3f}]",
+        timestamp,
+        voltage,
+        scaledValue
+    );
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(g_recordsJson)) {
+        return 0;
+    }
+
+    doc["machine_id"] = machine_id.c_str();
+    doc["status"] = "stable";
+    doc["unit_P"] = unit_P.c_str();
+    doc["count"] = 1;
+    doc["records"] = g_recordsJson;
     return serializeJson(doc, out, outSize);
 }
 
@@ -1098,6 +1144,20 @@ void loop() {
     canvas.setTextColor(CYAN);
     canvas.setCursor(0, 118);
     canvas.print(nowText);
+
+    // ハートビート送信結果を小さく表示
+    if (g_hasHeartbeatResult && (currentTime - g_lastHeartbeatResultAt) <= HEARTBEAT_RESULT_DISPLAY_MS) {
+        canvas.setTextSize(1);
+        if (g_lastHeartbeatOk) {
+            canvas.setTextColor(GREENYELLOW);
+            canvas.setCursor(110, 0);
+            canvas.print("ok");
+        } else {
+            canvas.setTextColor(RED);
+            canvas.setCursor(106, 0);
+            canvas.print("err");
+        }
+    }
     
     // スプライトを画面に一気に転送（ちらつき防止）
     canvas.pushSprite(0, 0);
@@ -1112,6 +1172,23 @@ void loop() {
         data.scaledValue = scaledValue;
         if (xQueueSend(recordQueue, &data, 0) != pdTRUE) {
             Serial.println("Record queue full, discarding data");
+        }
+    } else if (wifiConnected) {
+        // 非録画かつWiFi接続中は1分ごとに安定状態のハートビートを送信
+        if (!g_heartbeatPending && (currentTime - lastHeartbeatQueueTime) >= HEARTBEAT_INTERVAL_MS) {
+            const size_t hbLen =
+                buildStableHeartbeatJson(voltage, scaledValue, nowText, g_heartbeatJson, sizeof(g_heartbeatJson));
+            lastHeartbeatQueueTime = currentTime;
+
+            if (hbLen > 0 && hbLen < sizeof(g_heartbeatJson)) {
+                g_heartbeatPending = true;
+                queuePostRequest(script_url, g_heartbeatJson, true);
+            } else {
+                Serial.println("Failed to build stable heartbeat JSON");
+                g_hasHeartbeatResult = true;
+                g_lastHeartbeatOk = false;
+                g_lastHeartbeatResultAt = currentTime;
+            }
         }
     }
     
