@@ -220,6 +220,7 @@ SemaphoreHandle_t sdMutex;
 File g_logFile;
 unsigned long g_lastLogFlushTime = 0;
 uint32_t g_logLinesSinceFlush = 0;
+char g_logFileName[32] = "/LOGDATA.csv";  // 起動時に年月日時分から生成
 
 // POSTデータ構造体
 typedef struct {
@@ -619,10 +620,10 @@ static bool ensureLogFileOpen() {
         return true;
     }
 
-    g_logFile = SD.open("/LOGDATA.csv", FILE_APPEND);
+    g_logFile = SD.open(g_logFileName, FILE_APPEND);
     if (!g_logFile) {
-        Serial.println("Failed to open LOGDATA.csv for append");
-        ESP_LOGE(TAG, "Failed to open LOGDATA.csv for append");
+        Serial.printf("Failed to open %s for append\n", g_logFileName);
+        ESP_LOGE(TAG, "Failed to open %s for append", g_logFileName);
         return false;
     }
     return true;
@@ -640,22 +641,39 @@ static void flushLogFileIfNeeded(unsigned long nowMs) {
     }
 }
 
-// LOGDATA.csvを初期化する関数
+// ログファイル名を年月日時分（各2桁）から生成する関数
+static void generateLogFileName() {
+    time_t now = time(nullptr);
+    struct tm t;
+    if (localtime_r(&now, &t) != nullptr) {
+        snprintf(g_logFileName, sizeof(g_logFileName), "/%02d%02d%02d%02d%02d.csv",
+                 t.tm_year % 100, t.tm_mon + 1, t.tm_mday,
+                 t.tm_hour, t.tm_min);
+    } else {
+        snprintf(g_logFileName, sizeof(g_logFileName), "/LOGDATA.csv");
+    }
+    Serial.printf("Log file name: %s\n", g_logFileName);
+}
+
+// ログファイルを初期化する関数
 void initLogFile() {
-    // LOGDATA.csvが存在するかチェック
-    if (SD.exists("/LOGDATA.csv")) {
-        Serial.println("LOGDATA.csv already exists");
+    // 現在時刻からファイル名を生成
+    generateLogFileName();
+
+    // 既存ファイルがある場合は追記（ヘッダー不要）
+    if (SD.exists(g_logFileName)) {
+        Serial.printf("%s already exists, will append\n", g_logFileName);
         return;
     }
-    
+
     // 新規作成してヘッダーを書き込む
-    File logFile = SD.open("/LOGDATA.csv", FILE_WRITE);
+    File logFile = SD.open(g_logFileName, FILE_WRITE);
     if (logFile) {
         logFile.println("timestamp,voltage,scaled_value,unit");
         logFile.close();
-        Serial.println("LOGDATA.csv created with header");
+        Serial.printf("%s created with header\n", g_logFileName);
     } else {
-        Serial.println("Failed to create LOGDATA.csv");
+        Serial.printf("Failed to create %s\n", g_logFileName);
     }
 }
 
@@ -940,15 +958,6 @@ void setup() {
     // Initialize SD Card and load config
     AtomS3.Display.println("Reading SD...");
     loadConfig();
-    
-    // Initialize log file
-    initLogFile();
-
-    if (sdMutex != nullptr && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        ensureLogFileOpen();
-        g_lastLogFlushTime = millis();
-        xSemaphoreGive(sdMutex);
-    }
 
     if (ssid == "") {
         AtomS3.Display.setTextColor(RED);
@@ -1005,6 +1014,14 @@ void setup() {
             Serial.printf("Time sync failed: %s\n", timeSyncReason.c_str());
         }
         delay(2000);
+
+        // 時刻確定後にログファイルを初期化
+        initLogFile();
+        if (sdMutex != nullptr && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            ensureLogFileOpen();
+            g_lastLogFlushTime = millis();
+            xSemaphoreGive(sdMutex);
+        }
         
         // Send reboot status
         char rebootJson[256];
@@ -1059,6 +1076,14 @@ void setup() {
         }
         
         AtomS3.Display.println("RTC: 2000");
+
+        // 時刻確定後にログファイルを初期化
+        initLogFile();
+        if (sdMutex != nullptr && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            ensureLogFileOpen();
+            g_lastLogFlushTime = millis();
+            xSemaphoreGive(sdMutex);
+        }
     }
     
     // Recordingタスクを起動（Core 0で実行、WiFi状態に関わらず）
