@@ -436,9 +436,16 @@ void loadConfig() {
 }
 
 // HTTP POSTリクエストを送信する関数
-bool sendPostRequest(const char* url, const char* jsonText) {
+bool sendPostRequest(const char* url, const char* jsonText, String* failReason = nullptr) {
+    if (failReason != nullptr) {
+        *failReason = "";
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("POST skipped: WiFi disconnected");
+        if (failReason != nullptr) {
+            *failReason = "wifi_disconnected";
+        }
         return false;
     }
 
@@ -447,6 +454,11 @@ bool sendPostRequest(const char* url, const char* jsonText) {
     if (freeHeap < MIN_HTTP_HEAP_BYTES || largestBlock < 20000) {
         Serial.printf("POST skipped: low heap (free=%u, largest=%u)\n", freeHeap, largestBlock);
         ESP_LOGW(TAG, "POST skipped: low heap (free=%u, largest=%u)", freeHeap, largestBlock);
+        if (failReason != nullptr) {
+            char reason[96];
+            snprintf(reason, sizeof(reason), "low_heap free=%u largest=%u", freeHeap, largestBlock);
+            *failReason = reason;
+        }
         return false;
     }
 
@@ -464,6 +476,9 @@ bool sendPostRequest(const char* url, const char* jsonText) {
 
     if (!begun) {
         Serial.println("POST begin failed");
+        if (failReason != nullptr) {
+            *failReason = "http_begin_failed";
+        }
         return false;
     }
 
@@ -473,6 +488,16 @@ bool sendPostRequest(const char* url, const char* jsonText) {
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(7000);
     int httpResponseCode = http.POST(jsonText);
+
+    if (httpResponseCode <= 0 && failReason != nullptr) {
+        *failReason = String("http_error(") + httpResponseCode + "):" + HTTPClient::errorToString(httpResponseCode);
+    } else if (httpResponseCode >= 400 && failReason != nullptr) {
+        String body = http.getString();
+        if (body.length() > 120) {
+            body = body.substring(0, 120) + "...";
+        }
+        *failReason = String("http_status=") + httpResponseCode + " body=" + body;
+    }
     
     Serial.printf("POST Response: %d (heap=%u)\n", httpResponseCode, ESP.getFreeHeap());
     http.end();
@@ -508,11 +533,24 @@ void postTask(void* parameter) {
         // キューからデータを取得（最大100ms待機）
         if (xQueueReceive(postQueue, &postData, pdMS_TO_TICKS(100)) == pdTRUE) {
             Serial.println("Processing POST request in background...");
-            bool ok = sendPostRequest(postData.url, postData.json);
+            String failReason;
+            bool ok = sendPostRequest(postData.url, postData.json, &failReason);
             if (!ok && WiFi.status() == WL_CONNECTED) {
                 // 一時的な通信失敗を軽減するため1回だけ即時リトライ
+                if (postData.heartbeat) {
+                    Serial.printf("Heartbeat POST attempt1 failed: %s\n", failReason.c_str());
+                }
                 vTaskDelay(pdMS_TO_TICKS(200));
-                ok = sendPostRequest(postData.url, postData.json);
+                String retryReason;
+                ok = sendPostRequest(postData.url, postData.json, &retryReason);
+                if (!ok) {
+                    failReason = retryReason;
+                }
+            }
+
+            if (!ok && postData.heartbeat) {
+                Serial.printf("Heartbeat POST failed: %s\n", failReason.c_str());
+                ESP_LOGW(TAG, "Heartbeat POST failed: %s", failReason.c_str());
             }
 
             if (postData.heartbeat) {
