@@ -1,6 +1,7 @@
 ssid=your_wifi_ssid
 password=your_wifi_password
 machine_id=atoms3_001
+group_id=DPG
 script_url=your_google_apps_script_url
 full_scale_V=5.0
 full_scale_P=100.0

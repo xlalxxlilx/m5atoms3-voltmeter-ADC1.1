@@ -268,7 +268,9 @@ float full_scale_V = 3.0;  // 3Vをフルスケールとする
 float full_scale_P = 100.0;
 String unit_P = "%";
 String machine_id = "ATOMS3-01";
+String group_id = "DPG";
 float voltage_offset = 0.0F;
+String g_macAddress = "";
 
 static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
@@ -412,6 +414,9 @@ void loadConfig() {
         } else if (line.startsWith("machine_id=")) {
             machine_id = line.substring(11);
             Serial.printf("Machine ID: %s\n", machine_id.c_str());
+        } else if (line.startsWith("group_id=")) {
+            group_id = line.substring(9);
+            Serial.printf("Group ID: %s\n", group_id.c_str());
         } else if (line.startsWith("full_scale_V=")) {
             full_scale_V = line.substring(13).toFloat();
             Serial.printf("Full scale V: %.2f\n", full_scale_V);
@@ -559,6 +564,7 @@ static size_t buildRecordingBatchJson(const BatchRecordData* records, size_t rec
     g_recordsJson[pos] = '\0';
 
     g_batchPostDoc["machine_id"] = machine_id.c_str();
+    g_batchPostDoc["group_id"] = group_id.c_str();
     g_batchPostDoc["status"] = "rec_batch";
     g_batchPostDoc["unit_P"] = unit_P.c_str();
     g_batchPostDoc["interval_sec"] = 10;
@@ -587,6 +593,7 @@ static const char* resetReasonStr(esp_reset_reason_t reason) {
 static size_t buildRebootJson(char* out, size_t outSize) {
     StaticJsonDocument<192> doc;
     doc["machine_id"] = machine_id.c_str();
+    doc["group_id"] = group_id.c_str();
     doc["status"] = "reboot";
     doc["reason"] = resetReasonStr(g_resetReason);
     return serializeJson(doc, out, outSize);
@@ -608,6 +615,7 @@ static size_t buildStableHeartbeatJson(float voltage, float scaledValue, const c
     }
 
     doc["machine_id"] = machine_id.c_str();
+    doc["group_id"] = group_id.c_str();
     doc["status"] = "stable";
     doc["unit_P"] = unit_P.c_str();
     doc["count"] = 1;
@@ -879,10 +887,10 @@ void setup() {
     Serial.println("Canvas sprite created");
 
     // Display MAC Address
-    String macAddr = WiFi.macAddress();
+    g_macAddress = WiFi.macAddress();
     AtomS3.Display.print("MAC:");
-    AtomS3.Display.println(macAddr);
-    Serial.printf("MAC: %s\n", macAddr.c_str());
+    AtomS3.Display.println(g_macAddress);
+    Serial.printf("MAC: %s\n", g_macAddress.c_str());
     delay(1000);
     
     // タイムゾーンのみ先に設定（NTPサーバ設定はWiFi接続後に実施）
@@ -1154,7 +1162,7 @@ void loop() {
     canvas.setTextSize(2);
     canvas.printf("%s\n", unit_P.c_str());
 
-    // 画面下部に現在時刻を表示
+    // 画面下部に識別情報と現在時刻を表示
     char nowText[24];
     time_t now = time(nullptr);
     struct tm nowTm;
@@ -1167,6 +1175,14 @@ void loop() {
     }
     canvas.setTextSize(1);
     canvas.setTextColor(CYAN);
+    canvas.setCursor(0, 88);
+    canvas.printf("#sym:%s #sym:%s", group_id.c_str(), machine_id.c_str());
+    canvas.setCursor(0, 98);
+    canvas.printf("MAC:%s", g_macAddress.c_str());
+    if (WiFi.status() == WL_CONNECTED) {
+        canvas.setCursor(0, 108);
+        canvas.printf("IP:%s", WiFi.localIP().toString().c_str());
+    }
     canvas.setCursor(0, 118);
     canvas.print(nowText);
 
